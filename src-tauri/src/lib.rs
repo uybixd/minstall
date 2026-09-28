@@ -22,6 +22,10 @@ pub fn run() {
             commands::get_storage_info,
             commands::install_watchface,
             commands::install_quick_app,
+            commands::list_watchfaces,
+            commands::delete_watchface,
+            commands::list_quick_apps,
+            commands::uninstall_quick_app,
             #[cfg(target_os = "linux")]
             commands::get_saved_authkey,
             #[cfg(target_os = "linux")]

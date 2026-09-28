@@ -6,6 +6,17 @@ import { open } from "@tauri-apps/plugin-dialog";
 type Device = { name: string; address: string; rssi: number };
 type Progress = { sent: number; total: number };
 type StorageInfo = { used: number; total: number };
+type WatchFaceItem = {
+  id: string;
+  name: string;
+  isCurrent: boolean;
+  canRemove: boolean;
+};
+type QuickAppItem = {
+  package: string;
+  name: string;
+  canRemove: boolean;
+};
 type PickerResult =
   | { status: "pending" | "missing" }
   | { status: "selected"; path: string }
@@ -101,6 +112,9 @@ function App() {
   const [binPath, setBinPath] = useState("");
   const [installKind, setInstallKind] = useState<InstallKind>("watchface");
   const [storage, setStorage] = useState<StorageInfo | null>(null);
+  const [faces, setFaces] = useState<WatchFaceItem[] | null>(null);
+  const [apps, setApps] = useState<QuickAppItem[] | null>(null);
+  const [managing, setManaging] = useState(false);
   const [progress, setProgress] = useState<Progress>({ sent: 0, total: 0 });
   const [logs, setLogs] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -375,6 +389,90 @@ function App() {
       ]);
     } catch (e) {
       setLogsAuto((prev) => [...prev, `存储查询失败: ${e}`]);
+    }
+  };
+
+  const refreshManaged = async () => {
+    setManaging(true);
+    setError(null);
+    try {
+      const [faceList, appList] = await Promise.all([
+        invoke<WatchFaceItem[]>("list_watchfaces"),
+        invoke<QuickAppItem[]>("list_quick_apps"),
+      ]);
+      setFaces(faceList);
+      setApps(appList);
+      setLogsAuto((prev) => [
+        ...prev,
+        `已安装: 表盘 ${faceList.length} 个 / 快应用 ${appList.length} 个`,
+      ]);
+    } catch (e) {
+      setError(String(e));
+      setLogsAuto((prev) => [...prev, `列表查询失败: ${e}`]);
+    } finally {
+      setManaging(false);
+    }
+  };
+
+  const applyRemoveOutcome = async (
+    outcome: "confirmed" | "transferred",
+    label: string
+  ) => {
+    if (outcome === "confirmed") {
+      setLogsAuto((prev) => [...prev, `${label}已删除（手环已确认）`]);
+      setSuccess(`${label}删除成功`);
+    } else {
+      setLogsAuto((prev) => [...prev, `${label}删除指令已发送，请在手环上确认`]);
+      setSuccess(`${label}删除指令已发送，请在手环上确认`);
+    }
+    await Promise.all([refreshManaged(), refreshStorage()]);
+  };
+
+  const doDeleteFace = async (item: WatchFaceItem) => {
+    const name = item.name || item.id;
+    if (!window.confirm(`确定删除表盘「${name}」？此操作不可恢复。`)) return;
+    setError(null);
+    setSuccess(null);
+    setBusy(true);
+    setWatchState("busy");
+    setWatchStatus("删除表盘…");
+    try {
+      const outcome = await invoke<"confirmed" | "transferred">("delete_watchface", {
+        id: item.id,
+      });
+      await applyRemoveOutcome(outcome, `表盘「${name}」`);
+      setWatchState("ok");
+      setWatchStatus("删除完成");
+    } catch (e) {
+      setError(String(e));
+      setWatchState("error");
+      setWatchStatus("删除失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doUninstallApp = async (item: QuickAppItem) => {
+    const name = item.name || item.package;
+    if (!window.confirm(`确定卸载快应用「${name}」？此操作不可恢复。`)) return;
+    setError(null);
+    setSuccess(null);
+    setBusy(true);
+    setWatchState("busy");
+    setWatchStatus("卸载快应用…");
+    try {
+      const outcome = await invoke<"confirmed" | "transferred">("uninstall_quick_app", {
+        package: item.package,
+      });
+      await applyRemoveOutcome(outcome, `快应用「${name}」`);
+      setWatchState("ok");
+      setWatchStatus("卸载完成");
+    } catch (e) {
+      setError(String(e));
+      setWatchState("error");
+      setWatchStatus("卸载失败");
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -703,6 +801,77 @@ function App() {
             <button className="btn btn--ghost" onClick={doDisconnect} disabled={busy}>
               断开连接
             </button>
+          </div>
+
+          <div className="field">
+            <div className="storage__top">
+              <label className="field__label">已安装管理</label>
+              <button
+                className="btn btn--ghost btn--sm"
+                onClick={refreshManaged}
+                disabled={busy || managing}
+              >
+                {managing ? "查询中…" : "查看 / 刷新"}
+              </button>
+            </div>
+            <p className="field__note">
+              删除第三方表盘、卸载快应用，释放手环存储。系统表盘 / 应用不可删除。
+            </p>
+
+            {faces !== null && (
+              <div className="manage-block">
+                <div className="manage-block__title">表盘（{faces.length}）</div>
+                {faces.length === 0 ? (
+                  <p className="empty-hint">未查询到表盘</p>
+                ) : (
+                  <ul className="manage-list">
+                    {faces.map((f) => (
+                      <li key={f.id} className="manage-list__item">
+                        <span className="manage-list__name">
+                          {f.name || f.id}
+                          {f.isCurrent ? "（当前）" : ""}
+                        </span>
+                        <span className="manage-list__meta">{f.id}</span>
+                        <button
+                          className="btn btn--ghost btn--sm"
+                          disabled={busy || !f.canRemove}
+                          title={f.canRemove ? "删除该表盘" : "系统表盘不可删除"}
+                          onClick={() => void doDeleteFace(f)}
+                        >
+                          删除
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+
+            {apps !== null && (
+              <div className="manage-block">
+                <div className="manage-block__title">快应用（{apps.length}）</div>
+                {apps.length === 0 ? (
+                  <p className="empty-hint">未查询到快应用</p>
+                ) : (
+                  <ul className="manage-list">
+                    {apps.map((a) => (
+                      <li key={a.package} className="manage-list__item">
+                        <span className="manage-list__name">{a.name || a.package}</span>
+                        <span className="manage-list__meta">{a.package}</span>
+                        <button
+                          className="btn btn--ghost btn--sm"
+                          disabled={busy || !a.canRemove}
+                          title={a.canRemove ? "卸载该快应用" : "系统应用不可卸载"}
+                          onClick={() => void doUninstallApp(a)}
+                        >
+                          卸载
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="log-term" ref={logRef}>

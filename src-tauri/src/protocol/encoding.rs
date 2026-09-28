@@ -468,6 +468,21 @@ pub fn encode_watchface_prepare(watchface_id: &str, size: u32) -> Vec<u8> {
     )
 }
 
+/// WatchFace REMOVE_WATCH_FACE（WatchFace{id=2}；astrobox wear_watch_face.proto）。
+/// 手环回同 id 包 WatchFace{success=4}。
+pub fn encode_remove_watchface(watchface_id: &str) -> Vec<u8> {
+    let wf = field_bytes(
+        WEARPACKET_PAYLOAD_WATCHFACE_ID as u64,
+        watchface_id.as_bytes(),
+    );
+    encode_wear_packet(
+        WEARPACKET_TYPE_WATCH_FACE,
+        WP_ID_REMOVE_WATCH_FACE,
+        6,
+        &wf,
+    )
+}
+
 /// Mass PREPARE（prepare_request{data_type, data_id=md5, data_length}）。
 pub fn encode_mass_prepare(md5: &[u8], size: u32) -> Vec<u8> {
     encode_mass_prepare_with_type(md5, size, MASS_DATA_TYPE)
@@ -494,6 +509,8 @@ pub struct WearPacket {
     pub prepare_status: Option<u8>,
     pub slice_length: Option<usize>,
     pub install_result_code: Option<u8>,
+    /// REMOVE_WATCH_FACE 回包 success（WatchFace.success=4）。
+    pub remove_success: Option<bool>,
 }
 
 /// WatchFace GET_INSTALLED_LIST 请求（type=4, id=0，无 payload——不传 payload 字段！）。
@@ -503,15 +520,26 @@ pub fn encode_get_installed_list() -> Vec<u8> {
     out
 }
 
-/// 从 GET_INSTALLED_LIST 响应提取表盘 id 列表。
+/// 表盘列表项（GET_INSTALLED_LIST 响应 WatchFaceItem，astrobox wear_watch_face.proto）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchFaceItem {
+    pub id: String,
+    pub name: String,
+    pub is_current: bool,
+    /// 是否可删除（系统表盘为 false）。proto 中 optional，缺省视为 true。
+    pub can_remove: bool,
+}
+
+/// 从 GET_INSTALLED_LIST 响应提取表盘条目。
 /// 实际结构（真机验证）：WatchFace payload(field 6) → face 列表容器(field 1)
-/// → 单个表盘条目(field 1) → id(field 1)。
-pub fn parse_watchface_list(data: &[u8]) -> Vec<String> {
+/// → 单个表盘条目(field 1) → {id=1, name=2, is_current=3, can_remove=4}。
+pub fn parse_watchface_items(data: &[u8]) -> Vec<WatchFaceItem> {
     let fields = match parse_proto_fields(data) {
         Ok(f) => f,
         Err(_) => return vec![],
     };
-    let mut ids = Vec::new();
+    let mut items = Vec::new();
     for (num, val) in &fields {
         if *num != 6 {
             continue;
@@ -531,15 +559,7 @@ pub fn parse_watchface_list(data: &[u8]) -> Vec<String> {
                                 }
                                 if let ProtoVal::Bytes(entry) = cv {
                                     if let Ok(ef) = parse_proto_fields(entry) {
-                                        for (en, ev) in &ef {
-                                            if *en == 1 {
-                                                if let ProtoVal::Bytes(idb) = ev {
-                                                    if let Ok(s) = String::from_utf8(idb.clone()) {
-                                                        ids.push(s);
-                                                    }
-                                                }
-                                            }
-                                        }
+                                        items.push(parse_watchface_entry(&ef));
                                     }
                                 }
                             }
@@ -549,7 +569,34 @@ pub fn parse_watchface_list(data: &[u8]) -> Vec<String> {
             }
         }
     }
-    ids
+    items
+}
+
+fn parse_watchface_entry(fields: &[(u64, ProtoVal)]) -> WatchFaceItem {
+    let mut item = WatchFaceItem {
+        id: String::new(),
+        name: String::new(),
+        is_current: false,
+        can_remove: true,
+    };
+    for (en, ev) in fields {
+        match (en, ev) {
+            (1, ProtoVal::Bytes(idb)) => {
+                if let Ok(s) = String::from_utf8(idb.clone()) {
+                    item.id = s;
+                }
+            }
+            (2, ProtoVal::Bytes(nb)) => {
+                if let Ok(s) = String::from_utf8(nb.clone()) {
+                    item.name = s;
+                }
+            }
+            (3, ProtoVal::Varint(v)) => item.is_current = *v != 0,
+            (4, ProtoVal::Varint(v)) => item.can_remove = *v != 0,
+            _ => {}
+        }
+    }
+    item
 }
 
 pub fn parse_wear_packet(data: &[u8]) -> Option<WearPacket> {
@@ -569,6 +616,7 @@ pub fn parse_wear_packet(data: &[u8]) -> Option<WearPacket> {
                 let wf = parse_proto_fields(b).ok()?;
                 for (wn, wv) in &wf {
                     match (wn, wv) {
+                        (4, ProtoVal::Varint(v)) => wp.remove_success = Some(*v != 0),
                         (5, ProtoVal::Varint(v)) => wp.prepare_status = Some(*v as u8),
                         (7, ProtoVal::Bytes(ir)) => {
                             // install_result{id=1, code=2}
@@ -1018,5 +1066,68 @@ mod tests {
         let wp = parse_wear_packet(&mass).unwrap();
         assert_eq!(wp.typ, Some(WEARPACKET_TYPE_MASS));
         assert_eq!(wp.id, Some(WP_ID_MASS_PREPARE));
+    }
+
+    #[test]
+    fn remove_watchface_encode_parse() {
+        // 请求：type=4 id=2 WatchFace{id=2("123")}
+        let pkt = encode_remove_watchface("123");
+        assert_eq!(pkt[0..2], [0x08, 0x04]); // type=4
+        assert_eq!(pkt[2..4], [0x10, 0x02]); // id=REMOVE_WATCH_FACE(2)
+        let wf = parse_proto_fields(&pkt).unwrap();
+        let body = wf
+            .iter()
+            .find_map(|(num, val)| (*num == 6).then_some(val))
+            .unwrap();
+        let ProtoVal::Bytes(wf_body) = body else {
+            panic!("WatchFace payload 应为 bytes");
+        };
+        assert_eq!(wf_body, &field_bytes(2, b"123"));
+
+        // 回包：type=4 id=2 WatchFace{success=4=true}
+        let wf = field_varint(4, 1);
+        let mut packet = field_varint(1, WEARPACKET_TYPE_WATCH_FACE as u64);
+        packet.extend_from_slice(&field_varint(2, WP_ID_REMOVE_WATCH_FACE as u64));
+        packet.extend_from_slice(&field_bytes(6, &wf));
+        let parsed = parse_wear_packet(&packet).unwrap();
+        assert_eq!(parsed.typ, Some(WEARPACKET_TYPE_WATCH_FACE));
+        assert_eq!(parsed.id, Some(WP_ID_REMOVE_WATCH_FACE));
+        assert_eq!(parsed.remove_success, Some(true));
+    }
+
+    #[test]
+    fn parses_watchface_list_items_with_remove_flags() {
+        let entry = {
+            let mut e = field_bytes(1, b"123");
+            e.extend_from_slice(&field_bytes(2, "表盘A".as_bytes()));
+            e.extend_from_slice(&field_varint(3, 1)); // is_current
+            e.extend_from_slice(&field_varint(4, 0)); // can_remove=false
+            e
+        };
+        let entry2 = {
+            let mut e = field_bytes(1, b"456");
+            e.extend_from_slice(&field_varint(4, 1));
+            e
+        };
+        let container = {
+            let mut c = field_bytes(1, &entry);
+            c.extend_from_slice(&field_bytes(1, &entry2));
+            c
+        };
+        let wf = field_bytes(1, &container);
+        let mut packet = field_varint(1, WEARPACKET_TYPE_WATCH_FACE as u64);
+        packet.extend_from_slice(&field_varint(2, WP_ID_GET_INSTALLED_LIST as u64));
+        packet.extend_from_slice(&field_bytes(6, &wf));
+
+        let items = parse_watchface_items(&packet);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, "123");
+        assert_eq!(items[0].name, "表盘A");
+        assert!(items[0].is_current);
+        assert!(!items[0].can_remove);
+        assert_eq!(items[1].id, "456");
+        assert_eq!(items[1].name, "");
+        assert!(!items[1].is_current);
+        assert!(items[1].can_remove); // 字段缺省视为可删
     }
 }

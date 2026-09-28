@@ -27,6 +27,19 @@ pub struct QuickAppInfo {
     pub version_code: u32,
 }
 
+/// 已安装快应用列表项（GET_INSTALLED_LIST 响应 AppItem，astrobox wear_thirdparty_app.proto）。
+/// fingerprint 是卸载请求（REMOVE_APP BasicInfo）的必需字段，不跨 IPC 暴露。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickAppItem {
+    pub package: String,
+    pub name: String,
+    /// 是否可卸载（系统应用为 false）。
+    pub can_remove: bool,
+    #[serde(skip)]
+    pub fingerprint: Vec<u8>,
+}
+
 #[derive(Debug, Deserialize)]
 struct Manifest {
     package: String,
@@ -54,7 +67,26 @@ pub fn encode_install_request(package: &str, version_code: u32, package_size: us
     packet
 }
 
-pub(crate) fn parse_quick_app_packages(data: &[u8]) -> Vec<String> {
+/// 快应用卸载请求（REMOVE_APP=3）：ThirdpartyApp{basic_info=5{package_name=1, fingerprint=2}}。
+/// fingerprint 必须原样取自 GET_INSTALLED_LIST 的 AppItem.fingerprint（astrobox 同款）。
+pub fn encode_remove_app(package: &str, fingerprint: &[u8]) -> Vec<u8> {
+    let mut basic_info = field_bytes(1, package.as_bytes());
+    basic_info.extend_from_slice(&field_bytes(2, fingerprint));
+
+    let thirdparty = field_bytes(WEARPACKET_PAYLOAD_BASIC_INFO as u64, &basic_info);
+    let mut packet = field_varint(1, WEARPACKET_TYPE_THIRDPARTY_APP as u64);
+    packet.extend_from_slice(&field_varint(2, WP_ID_REMOVE_APP as u64));
+    packet.extend_from_slice(&field_bytes(
+        WEARPACKET_PAYLOAD_THIRDPARTY_APP as u64,
+        &thirdparty,
+    ));
+    packet
+}
+
+/// 解析快应用列表响应为完整条目（含 fingerprint / can_remove，卸载用）。
+/// 结构（astrobox wear_thirdparty_app.proto）：ThirdpartyApp.app_item_list=1 →
+/// AppItem.List{list=1} → AppItem{package_name=1, fingerprint=2, version_code=3, can_remove=4, app_name=5}。
+pub(crate) fn parse_quick_app_items(data: &[u8]) -> Vec<QuickAppItem> {
     let fields = match parse_proto_fields(data) {
         Ok(fields) => fields,
         Err(_) => return vec![],
@@ -95,14 +127,32 @@ pub(crate) fn parse_quick_app_packages(data: &[u8]) -> Vec<String> {
             let ProtoVal::Bytes(app) = value else {
                 return None;
             };
-            let app = parse_proto_fields(app).ok()?;
-            app.iter().find_map(|(app_num, app_value)| {
-                (*app_num == 1).then(|| match app_value {
-                    ProtoVal::Bytes(package) => String::from_utf8(package.clone()).ok(),
-                    ProtoVal::Varint(_) => None,
-                })
-            })?
+            parse_proto_fields(app).ok().map(|app_fields| {
+                let mut item = QuickAppItem {
+                    package: String::new(),
+                    name: String::new(),
+                    can_remove: true,
+                    fingerprint: Vec::new(),
+                };
+                for (app_num, app_value) in &app_fields {
+                    match (app_num, app_value) {
+                        (1, ProtoVal::Bytes(package)) => {
+                            item.package = String::from_utf8_lossy(package).into_owned();
+                        }
+                        (2, ProtoVal::Bytes(fingerprint)) => {
+                            item.fingerprint = fingerprint.clone();
+                        }
+                        (4, ProtoVal::Varint(v)) => item.can_remove = *v != 0,
+                        (5, ProtoVal::Bytes(name)) => {
+                            item.name = String::from_utf8_lossy(name).into_owned();
+                        }
+                        _ => {}
+                    }
+                }
+                item
+            })
         })
+        .filter(|item| !item.package.is_empty())
         .collect()
 }
 
@@ -211,11 +261,11 @@ where
     }
 }
 
-async fn query_installed_packages<S>(
+async fn query_installed_items<S>(
     channel: &mut SppChannel<'_, S>,
     session: &Session,
     sequence: &mut u8,
-) -> Vec<String>
+) -> Vec<QuickAppItem>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -252,13 +302,34 @@ where
             let Some(body) = watchface::protobuf_body(&payload, session) else {
                 continue;
             };
-            let packages = parse_quick_app_packages(&body);
-            if !packages.is_empty() {
-                eprintln!("[minstall] 快应用列表: {packages:?}");
-                return packages;
+            let items = parse_quick_app_items(&body);
+            if !items.is_empty() {
+                eprintln!(
+                    "[minstall] 快应用列表: {:?}",
+                    items
+                        .iter()
+                        .map(|item| item.package.as_str())
+                        .collect::<Vec<_>>()
+                );
+                return items;
             }
         }
     }
+}
+
+async fn query_installed_packages<S>(
+    channel: &mut SppChannel<'_, S>,
+    session: &Session,
+    sequence: &mut u8,
+) -> Vec<String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    query_installed_items(channel, session, sequence)
+        .await
+        .into_iter()
+        .map(|item| item.package)
+        .collect()
 }
 
 async fn send_mass<S>(
@@ -422,6 +493,78 @@ where
     }
 }
 
+/// 查询已安装快应用列表（含 fingerprint/can_remove，卸载用）。
+pub async fn list<S>(
+    stream: &mut S,
+    session: &Session,
+    sequence: &mut u8,
+) -> Result<Vec<QuickAppItem>, BleError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut channel = SppChannel::new(stream);
+    let items = query_installed_items(&mut channel, session, sequence).await;
+    if items.is_empty() {
+        eprintln!("[minstall] 快应用列表为空或查询失败");
+    }
+    Ok(items)
+}
+
+/// 卸载快应用（REMOVE_APP=3）。
+/// 协议无卸载结果回包（astrobox 同为 fire-and-forget），发完后查询列表确认包名消失。
+pub async fn uninstall<S>(
+    stream: &mut S,
+    session: &Session,
+    sequence: &mut u8,
+    package: &str,
+) -> Result<PushOutcome, BleError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut channel = SppChannel::new(stream);
+    let items = query_installed_items(&mut channel, session, sequence).await;
+    let Some(item) = items.iter().find(|item| item.package == package) else {
+        return Err(BleError::PushFailed {
+            chunk: 0,
+            detail: format!("手环上未找到快应用 {package}"),
+        });
+    };
+    if !item.can_remove {
+        return Err(BleError::PushFailed {
+            chunk: 0,
+            detail: format!("快应用 {package} 不可卸载（系统应用）"),
+        });
+    }
+    if item.fingerprint.is_empty() {
+        return Err(BleError::PushFailed {
+            chunk: 0,
+            detail: format!("快应用 {package} 缺少 fingerprint，无法卸载"),
+        });
+    }
+
+    eprintln!(
+        "[minstall] → ThirdpartyApp REMOVE_APP package={package} fingerprint={}B",
+        item.fingerprint.len()
+    );
+    send_encrypted(
+        &mut channel,
+        session,
+        sequence,
+        &encode_remove_app(package, &item.fingerprint),
+    )
+    .await?;
+    // 手环无回包；短等后查列表确认（同 astrobox 的兜底做法）
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let packages = query_installed_packages(&mut channel, session, sequence).await;
+    if packages.iter().any(|p| p == package) {
+        eprintln!("[minstall] 快应用列表仍有 {package}，按已发送处理");
+        Ok(PushOutcome::Transferred)
+    } else {
+        eprintln!("[minstall] 快应用列表确认已卸载: {package}");
+        Ok(PushOutcome::Confirmed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Write};
@@ -429,10 +572,10 @@ mod tests {
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
 
-    use super::{encode_install_request, parse_quick_app_packages, parse_rpk};
+    use super::{encode_install_request, encode_remove_app, parse_quick_app_items, parse_rpk};
     use crate::protocol::consts::{
         MASS_DATA_TYPE_THIRDPARTY_APP, WEARPACKET_PAYLOAD_THIRDPARTY_APP,
-        WEARPACKET_TYPE_THIRDPARTY_APP,
+        WEARPACKET_TYPE_THIRDPARTY_APP, WP_ID_REMOVE_APP,
     };
     use crate::protocol::encoding::{
         encode_mass_prepare_with_type, field_bytes, field_varint, parse_proto_fields,
@@ -479,10 +622,55 @@ mod tests {
             &thirdparty,
         ));
 
+        let items = parse_quick_app_items(&packet);
         assert_eq!(
-            parse_quick_app_packages(&packet),
+            items.iter().map(|item| item.package.as_str()).collect::<Vec<_>>(),
             vec!["com.application.watch.demo"]
         );
+    }
+
+    #[test]
+    fn parses_quick_app_items_with_fingerprint_and_flags() {
+        let app = {
+            let mut app = field_bytes(1, b"com.application.watch.demo");
+            app.extend_from_slice(&field_bytes(2, &[0xde, 0xad, 0xbe, 0xef]));
+            app.extend_from_slice(&field_varint(4, 0)); // can_remove=false
+            app.extend_from_slice(&field_bytes(5, "存储空间".as_bytes()));
+            app
+        };
+        let list = field_bytes(1, &app);
+        let thirdparty = field_bytes(1, &list);
+        let mut packet = field_varint(1, WEARPACKET_TYPE_THIRDPARTY_APP as u64);
+        packet.extend_from_slice(&field_varint(2, 0));
+        packet.extend_from_slice(&field_bytes(
+            WEARPACKET_PAYLOAD_THIRDPARTY_APP as u64,
+            &thirdparty,
+        ));
+
+        let items = parse_quick_app_items(&packet);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].package, "com.application.watch.demo");
+        assert_eq!(items[0].name, "存储空间");
+        assert!(!items[0].can_remove);
+        assert_eq!(items[0].fingerprint, vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn encodes_thirdparty_app_remove_request() {
+        let encoded = encode_remove_app("com.example.test", &[0xab, 0xcd]);
+
+        // WearPacket{type=20, id=3, thirdparty_app=22{basic_info=5{package_name=1, fingerprint=2}}}
+        assert_eq!(
+            encoded,
+            vec![
+                0x08, 0x14, 0x10, 0x03, 0xb2, 0x01, 0x18, 0x2a, 0x16, 0x0a, 0x10, b'c', b'o', b'm',
+                b'.', b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b't', b'e', b's', b't', 0x12,
+                0x02, 0xab, 0xcd,
+            ]
+        );
+        let parsed = parse_proto_fields(&encoded).unwrap();
+        assert_eq!(parsed[0].1, ProtoVal::Varint(WEARPACKET_TYPE_THIRDPARTY_APP as u64));
+        assert_eq!(parsed[1].1, ProtoVal::Varint(WP_ID_REMOVE_APP as u64));
     }
 
     #[test]

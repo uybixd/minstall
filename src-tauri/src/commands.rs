@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 
 use crate::ble::connection::Manager;
 use crate::ble::scanner;
+use crate::protocol::encoding::WatchFaceItem;
 use crate::protocol::{auth, quickapp, watchface};
 
 pub type SharedManager = Arc<Mutex<Manager>>;
@@ -210,6 +211,68 @@ pub async fn install_quick_app(
         );
     })
     .await;
+    mgr.advance_seq(seq);
+    result.map_err(|e| e.to_string())
+}
+
+/// 查询已安装表盘列表（需已连接并认证）。
+#[tauri::command]
+pub async fn list_watchfaces(state: State<'_, SharedManager>) -> Result<Vec<WatchFaceItem>, String> {
+    let mut mgr = state.inner().lock().await;
+    let session = mgr.session().map_err(|e| e.to_string())?;
+    let mut seq = mgr.seq();
+    let stream = mgr.stream_mut().map_err(|e| e.to_string())?;
+    let items = watchface::list(stream, &session, &mut seq)
+        .await
+        .map_err(|e| e.to_string())?;
+    mgr.advance_seq(seq);
+    Ok(items)
+}
+
+/// 删除表盘（需已连接并认证）。id 为 GET_INSTALLED_LIST 返回的表盘 id。
+#[tauri::command]
+pub async fn delete_watchface(
+    state: State<'_, SharedManager>,
+    id: String,
+) -> Result<watchface::PushOutcome, String> {
+    let mut mgr = state.inner().lock().await;
+    let session = mgr.session().map_err(|e| e.to_string())?;
+    let mut seq = mgr.seq();
+    let stream = mgr.stream_mut().map_err(|e| e.to_string())?;
+    eprintln!("[minstall] delete_watchface: id={id} (seq={seq})");
+    let result = watchface::delete(stream, &session, &mut seq, &id).await;
+    mgr.advance_seq(seq);
+    result.map_err(|e| e.to_string())
+}
+
+/// 查询已安装快应用列表（需已连接并认证）。
+#[tauri::command]
+pub async fn list_quick_apps(
+    state: State<'_, SharedManager>,
+) -> Result<Vec<quickapp::QuickAppItem>, String> {
+    let mut mgr = state.inner().lock().await;
+    let session = mgr.session().map_err(|e| e.to_string())?;
+    let mut seq = mgr.seq();
+    let stream = mgr.stream_mut().map_err(|e| e.to_string())?;
+    let items = quickapp::list(stream, &session, &mut seq)
+        .await
+        .map_err(|e| e.to_string())?;
+    mgr.advance_seq(seq);
+    Ok(items)
+}
+
+/// 卸载快应用（需已连接并认证）。package 为 GET_INSTALLED_LIST 返回的包名。
+#[tauri::command]
+pub async fn uninstall_quick_app(
+    state: State<'_, SharedManager>,
+    package: String,
+) -> Result<watchface::PushOutcome, String> {
+    let mut mgr = state.inner().lock().await;
+    let session = mgr.session().map_err(|e| e.to_string())?;
+    let mut seq = mgr.seq();
+    let stream = mgr.stream_mut().map_err(|e| e.to_string())?;
+    eprintln!("[minstall] uninstall_quick_app: package={package} (seq={seq})");
+    let result = quickapp::uninstall(stream, &session, &mut seq, &package).await;
     mgr.advance_seq(seq);
     result.map_err(|e| e.to_string())
 }

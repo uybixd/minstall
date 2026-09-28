@@ -74,6 +74,18 @@ pub const WP_ID_PREPARE_INSTALL_APP: u8 = 1;
 pub const WP_ID_REPORT_INSTALL_APP_RESULT: u8 = 2;
 /// id=REPORT_INSTALL_RESULT
 pub const WP_ID_REPORT_INSTALL_RESULT: u8 = 5;
+/// id=REMOVE_WATCH_FACE（删除表盘；来源 astrobox wear_watch_face.proto WatchFaceID）。
+pub const WP_ID_REMOVE_WATCH_FACE: u8 = 2;
+/// 快应用 id=REMOVE_APP（卸载；来源 astrobox wear_thirdparty_app.proto ThirdpartyAppID）。
+pub const WP_ID_REMOVE_APP: u8 = 3;
+
+// ---- WearPacket 卸载/删除 payload 字段号（astrobox wear_watch_face.proto / wear_thirdparty_app.proto）----
+/// WatchFace payload oneof 中 id（REMOVE_WATCH_FACE 请求）的字段号 = 2。
+pub const WEARPACKET_PAYLOAD_WATCHFACE_ID: u8 = 2;
+/// WatchFace payload oneof 中 success（REMOVE 回包 bool）的字段号 = 4。
+pub const WEARPACKET_PAYLOAD_WATCHFACE_SUCCESS: u8 = 4;
+/// ThirdpartyApp payload oneof 中 BasicInfo（REMOVE_APP 请求）的字段号 = 5。
+pub const WEARPACKET_PAYLOAD_BASIC_INFO: u8 = 5;
 /// id=GET_STORAGE_INFO
 pub const WP_ID_GET_STORAGE_INFO: u8 = 62;
 /// Mass id=PREPARE

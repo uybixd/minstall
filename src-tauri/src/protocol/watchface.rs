@@ -488,12 +488,12 @@ where
     }
 }
 
-/// 发 GET_INSTALLED_LIST 并解析响应中的表盘 id 列表。
-async fn query_installed_ids<S>(
+/// 发 GET_INSTALLED_LIST 并解析响应中的表盘条目。
+async fn query_installed_items<S>(
     ch: &mut SppChannel<'_, S>,
     session: &Session,
     seq: &mut u8,
-) -> Vec<String>
+) -> Vec<WatchFaceItem>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -531,18 +531,154 @@ where
                     if wp.typ == Some(WEARPACKET_TYPE_WATCH_FACE)
                         && wp.id == Some(WP_ID_GET_INSTALLED_LIST)
                     {
-                        let ids = parse_watchface_list(&body);
-                        eprintln!("[minstall] 解析到 {} 个表盘: {:?}", ids.len(), ids);
+                        let items = parse_watchface_items(&body);
+                        eprintln!(
+                            "[minstall] 解析到 {} 个表盘: {:?}",
+                            items.len(),
+                            items
+                                .iter()
+                                .map(|item| item.id.as_str())
+                                .collect::<Vec<_>>()
+                        );
                         eprintln!(
                             "[minstall] 原始响应 body hex (前 256B): {}",
                             hex_prefix(&body, 256)
                         );
-                        return ids;
+                        return items;
                     }
                 }
             }
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+    }
+}
+
+async fn query_installed_ids<S>(
+    ch: &mut SppChannel<'_, S>,
+    session: &Session,
+    seq: &mut u8,
+) -> Vec<String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    query_installed_items(ch, session, seq)
+        .await
+        .into_iter()
+        .map(|item| item.id)
+        .collect()
+}
+
+/// 查询已安装表盘列表（含 name/is_current/can_remove，删除用）。
+pub async fn list<S>(
+    stream: &mut S,
+    session: &Session,
+    seq_ref: &mut u8,
+) -> Result<Vec<WatchFaceItem>, BleError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut seq = *seq_ref;
+    let mut ch = SppChannel::new(stream);
+    let items = query_installed_items(&mut ch, session, &mut seq).await;
+    *seq_ref = seq;
+    if items.is_empty() {
+        eprintln!("[minstall] 表盘列表为空或查询失败");
+    }
+    Ok(items)
+}
+
+/// 删除表盘（REMOVE_WATCH_FACE=2）：发删除请求 → 等 success 回包（短等）→ 列表兜底确认。
+/// 手环回 `type=4, id=2, WatchFace{success=4}`：true=已删除，false=拒绝。
+pub async fn delete<S>(
+    stream: &mut S,
+    session: &Session,
+    seq_ref: &mut u8,
+    watchface_id: &str,
+) -> Result<PushOutcome, BleError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut seq = *seq_ref;
+    let mut ch = SppChannel::new(stream);
+
+    // 先查列表：不存在直接报错；can_remove=false 拒绝（系统表盘）
+    let items = query_installed_items(&mut ch, session, &mut seq).await;
+    let Some(item) = items.iter().find(|item| item.id == watchface_id) else {
+        *seq_ref = seq;
+        return Err(BleError::PushFailed {
+            chunk: 0,
+            detail: format!("手环上未找到表盘 {watchface_id}"),
+        });
+    };
+    if !item.can_remove {
+        *seq_ref = seq;
+        return Err(BleError::PushFailed {
+            chunk: 0,
+            detail: format!("表盘 {} 不可删除（系统表盘）", item.name),
+        });
+    }
+
+    eprintln!("[minstall] → WatchFace REMOVE_WATCH_FACE id={watchface_id}");
+    let frame = build_protobuf_frame(seq, &encode_remove_watchface(watchface_id), true, &session.enc_key);
+    seq = seq.wrapping_add(1);
+    ch.write(&frame).await.map_err(BleError::ConnectFailed)?;
+
+    // 等 success 回包（同 id=2）；手环可能不推，短等 10s 后列表兜底
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    let mut ack: Option<bool> = None;
+    while ack.is_none() {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        match tokio::time::timeout(std::time::Duration::from_millis(200), ch.read_more()).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) | Ok(Err(_)) => break,
+            Err(_) => continue,
+        }
+        for (pt, _fseq, payload) in ch.drain_ack().await.unwrap_or_default() {
+            if pt != V2_PACKET_DATA {
+                continue;
+            }
+            if let Some(body) = protobuf_body(&payload, session) {
+                if let Some(wp) = parse_wear_packet(&body) {
+                    eprintln!(
+                        "[minstall] 删除响应 typ={:?} id={:?} success={:?}",
+                        wp.typ, wp.id, wp.remove_success
+                    );
+                    if wp.typ == Some(WEARPACKET_TYPE_WATCH_FACE)
+                        && wp.id == Some(WP_ID_REMOVE_WATCH_FACE)
+                    {
+                        ack = wp.remove_success;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+    }
+
+    if let Some(success) = ack {
+        *seq_ref = seq;
+        return if success {
+            eprintln!("[minstall] ★ 表盘删除成功: {watchface_id}");
+            Ok(PushOutcome::Confirmed)
+        } else {
+            Err(BleError::PushFailed {
+                chunk: 0,
+                detail: "手环拒绝删除该表盘".into(),
+            })
+        };
+    }
+
+    // 未收到回包：列表兜底确认（同安装确认策略，不长时间等待）
+    eprintln!("[minstall] 删除回包 10s 未收到，列表兜底确认");
+    let items = query_installed_items(&mut ch, session, &mut seq).await;
+    *seq_ref = seq;
+    if items.iter().any(|item| item.id == watchface_id) {
+        eprintln!("[minstall] 表盘列表仍有 {watchface_id}，按已发送处理");
+        Ok(PushOutcome::Transferred)
+    } else {
+        eprintln!("[minstall] ★ 表盘列表确认已删除: {watchface_id}");
+        Ok(PushOutcome::Confirmed)
     }
 }
 
