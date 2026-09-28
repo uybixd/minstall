@@ -107,6 +107,16 @@ DATA 包 payload：`[channel u8 低 nibble][opCode u8][body]`
 
 **存储查询**：`WearPacket{type=SYSTEM(2), id=GET_STORAGE_INFO(62)}` → `storage_info=44{used,total}`（真机 used=12.62MB / total=259.38MB）。
 
+### 2.5.1 表盘删除（REMOVE_WATCH_FACE）
+
+```
+1. GET_INSTALLED_LIST（type=4, id=0）→ WatchFace.watch_face_list=1{WatchFaceItem.List{list=1}}
+   → WatchFaceItem{id=1, name=2, is_current=3, can_remove=4}（系统表盘 can_remove=false）
+2. WearPacket{type=4, id=2, watch_face=6{id=2 <表盘 id 字符串>}}（加密）
+3. 手环回同 id 包 watch_face=6{success=4(bool)}：true=已删除，false=拒绝
+   （手环可能不推，短等后列表兜底确认——同安装确认策略）
+```
+
 ### 2.6 Vela 快应用（`.rpk`）安装
 
 快应用使用独立的 ThirdpartyApp WearPacket，但复用同一 MASS 分片传输：
@@ -123,6 +133,20 @@ DATA 包 payload：`[channel u8 低 nibble][opCode u8][body]`
 ```
 
 `.rpk` 是 ZIP 包，安装前必须能读取 `manifest.json`，且 `deviceTypeList` 包含 `watch`。
+
+### 2.6.1 快应用卸载（REMOVE_APP）
+
+```
+1. GET_INSTALLED_LIST（type=20, id=0）→ ThirdpartyApp.app_item_list=1{AppItem.List{list=1}}
+   → AppItem{package_name=1, fingerprint=2, version_code=3, can_remove=4, app_name=5}
+2. WearPacket{type=20, id=3, thirdparty_app=22{
+     basic_info=5{package_name=1, fingerprint=2}
+   }}（加密）
+   ⚠️ fingerprint 必须原样取自列表项，不能自算
+3. 协议无卸载结果回包（fire-and-forget，astrobox 同）；发完后查询列表确认包名消失
+```
+
+卸载/删除消息来源：astrobox `wear_thirdparty_app.proto` / `wear_watch_face.proto`（REMOVE_APP=3 / REMOVE_WATCH_FACE=2，字段号见上）。
 
 ### 2.7 Bin 表盘文件格式
 
@@ -285,6 +309,6 @@ adb shell "dumpsys bluetooth_manager | grep -iE 'RFCOMM Connection|MOST_FEQ_ADDR
 ## 7. 待办 / 已知限制
 
 - 安装「已确认」提示：当前手环不推 InstallResult 时返回「已传输」，可考虑让用户手动确认收尾
-- 手环反复安装会累积存储（覆盖不彻底），建议定期用官方 App 清理
+- 手环反复安装会累积存储（覆盖不彻底）：已提供「已安装管理」删除表盘 / 卸载快应用
 - authkey 与手环绑定状态关联；重新绑定后需重新提取
 - 发布需注意：工具绕过官方 App（非官方协议逆向），仅供个人研究/自用；建议 GitHub 自托管分发，不上应用商店
