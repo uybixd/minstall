@@ -2,9 +2,9 @@
 
 ## [Unreleased]
 
-## [0.1.0-fork.1] - 2026-09-28
+## [0.2.0-fork.1] - 2026-09-30
 
-- fork 基线：上游 minstall 0.2.0。
+- fork 基线：上游 minstall 0.2.0，fork 版本号从 0.2.0-fork.N 起算。
 - 增加「已安装管理」：删除第三方表盘（REMOVE_WATCH_FACE）、卸载快应用（REMOVE_APP）。
 - 增加 Linux Secret Service 和 Android Keystore authkey 安全存储。
 - 增加可选的“记住 authkey”体验，默认不保存。
